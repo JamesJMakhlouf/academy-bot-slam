@@ -5,9 +5,20 @@
 #include "tf2/LinearMath/Quaternion.h"
 
 #include "acadbot_courier_interfaces/srv/accept_job.hpp"
+#include "acadbot_courier_interfaces/action/execute_delivery.hpp"
+
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <atomic>   
+#include <future>
+#include <thread>
 
 using namespace std::chrono_literals;
 using AcceptJob = acadbot_courier_interfaces::srv::AcceptJob;
+using ExecuteDelivery = acadbot_courier_interfaces::action::ExecuteDelivery;
+using GoalHandleDel = rclcpp_action::ServerGoalHandle<ExecuteDelivery>;
 using NavigateToPose = nav2_msgs::action::NavigateToPose;
 using GoalHandleNav = rclcpp_action::ClientGoalHandle<NavigateToPose>;
 
@@ -38,7 +49,19 @@ class CourierServer : public rclcpp::Node {
             accept_service_ = create_service<AcceptJob>("courier/accept_job", std::bind(&CourierServer::handle_accept_job, this, std::placeholders::_1, std::placeholders::_2));
 
             nav_client_ = rclcpp_action::create_client<NavigateToPose>(this, "navigate_to_pose");
-            startup_timer_ = create_wall_timer(1s, std::bind(&CourierServer::wait_for_nav2, this));
+
+            feedback_timer_ = create_wall_timer(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(feedback_period_sec_)),
+                std::bind(&CourierServer::publish_status_feedback, this)
+            );
+
+            delivery_server_ = rclcpp_action::create_server<ExecuteDelivery>(
+                this,
+                "courier/execute_delivery",
+                std::bind(&CourierServer::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
+                std::bind(&CourierServer::handle_cancel, this, std::placeholders::_1),
+                std::bind(&CourierServer::handle_accepted, this, std::placeholders::_1)
+            );
 
             RCLCPP_INFO(get_logger(), "Courier server initialized with %zu locations, %d retries", locations_.size(), retry_count_);
             for (const auto& [name, loc] : locations_) {
@@ -59,10 +82,19 @@ class CourierServer : public rclcpp::Node {
         std::unordered_map<uint32_t, Job> jobs_;
         uint32_t next_job_id_{1};
         bool job_active_{false};
-        uint32_t active_job_id_{0};
+        std::atomic<uint32_t> active_job_id_{0};
 
         rclcpp_action::Client<NavigateToPose>::SharedPtr nav_client_;
         rclcpp::TimerBase::SharedPtr startup_timer_;
+
+        rclcpp_action::Server<ExecuteDelivery>::SharedPtr delivery_server_;
+        GoalHandleNav::SharedPtr active_nav_goal_;
+        rclcpp::TimerBase::SharedPtr feedback_timer_;
+        std::shared_ptr<GoalHandleDel> feedback_goal_;
+        std::string fb_leg_, fb_target_;
+        float fb_distance_{-1.0f};
+        std::mutex state_mutex_;
+        std::atomic<bool> cancelling_{false};
 
         void handle_accept_job(const std::shared_ptr<AcceptJob::Request> request, std::shared_ptr<AcceptJob::Response> response) {
             auto pickup = locations_.find(request->pickup_name);
@@ -88,7 +120,7 @@ class CourierServer : public rclcpp::Node {
 
             if (busy_reject_ && job_active_) {
                 response->accepted = false;
-                response->reason = "robot is busy with job " + std::to_string(active_job_id_);
+                response->reason = "robot is busy with job " + std::to_string(active_job_id_.load());
                 return;
             }
 
@@ -100,15 +132,6 @@ class CourierServer : public rclcpp::Node {
             RCLCPP_INFO(get_logger(), "Accepted job %u: %s -> %s", id, request->pickup_name.c_str(), request->dropoff_name.c_str());
         }
 
-        void wait_for_nav2() {
-            if (!nav_client_->action_server_is_ready()) {
-                RCLCPP_INFO(get_logger(), "Waiting for Nav2 'navigate_to_pose' server...");
-                return;
-            }
-            startup_timer_->cancel();
-            std::thread(&CourierServer::drive_to, this, "lab_bench").detach();
-        }
-
         const char* result_code_name(rclcpp_action::ResultCode code) {
             switch (code) {
                 case rclcpp_action::ResultCode::SUCCEEDED: return "SUCCEEDED";
@@ -118,13 +141,12 @@ class CourierServer : public rclcpp::Node {
                 default: return "???";
             }
         }
-
         
-        void drive_to(const std::string& name) {
+        rclcpp_action::ResultCode drive_to(const std::string& name, const std::shared_ptr<GoalHandleDel>& goal_handle, const std::string& leg) {
             auto it = locations_.find(name);
             if (it == locations_.end()) {
                 RCLCPP_ERROR(get_logger(), "Unknown location '%s'", name.c_str());
-                return;
+                return rclcpp_action::ResultCode::ABORTED;
             }
             const Location& loc = it->second;
 
@@ -146,24 +168,133 @@ class CourierServer : public rclcpp::Node {
             auto future = promise->get_future();
 
             rclcpp_action::Client<NavigateToPose>::SendGoalOptions options;
-            options.goal_response_callback = [promise](GoalHandleNav::SharedPtr gh) {
+            options.goal_response_callback = [this, promise](GoalHandleNav::SharedPtr gh) {
                 if (!gh) {
                     promise->set_value(rclcpp_action::ResultCode::ABORTED);
+                } else {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    active_nav_goal_ = gh;
                 }
             };
-            options.feedback_callback = [](GoalHandleNav::SharedPtr, const std::shared_ptr<const NavigateToPose::Feedback> fb) {
-                RCLCPP_INFO(rclcpp::get_logger("courier_server"), " distance remaining %.2f m", fb->distance_remaining);
+            options.feedback_callback = [this](GoalHandleNav::SharedPtr, const std::shared_ptr<const NavigateToPose::Feedback> fb) {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                fb_distance_ = fb->distance_remaining;
+                RCLCPP_INFO(get_logger(), "[%s] -> %s, %.2f m left", fb_leg_.c_str(), fb_target_.c_str(), fb->distance_remaining);
             };
             options.result_callback = [promise](const GoalHandleNav::WrappedResult& result) {
                 promise->set_value(result.code);
             };
 
+            if (!nav_client_->wait_for_action_server(10s)) {
+                RCLCPP_WARN(get_logger(), "Nav2 'navigate_to_pose' server is not ready; aborting leg %s", leg.c_str());
+                return rclcpp_action::ResultCode::ABORTED;
+            }
+            
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                fb_leg_ = leg;
+                fb_target_ = name;
+                fb_distance_ = -1.0f;
+                feedback_goal_ = goal_handle;
+            }
+
             nav_client_->async_send_goal(goal, options);
 
             future.wait();
             auto code = future.get();
-            RCLCPP_INFO(get_logger(), "drive_to(%s) finished with code %d (%s)", name.c_str(), static_cast<int>(code), result_code_name(code));
+            return code;
         }
+
+        void publish_status_feedback() {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!feedback_goal_ || fb_distance_ < 0.0f) return;
+            auto cf = std::make_shared<ExecuteDelivery::Feedback>();
+            cf->leg = fb_leg_;
+            cf->target_location = fb_target_;
+            cf->distance_remaining = fb_distance_;
+            feedback_goal_->publish_feedback(cf);
+        }
+
+        rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID&, std::shared_ptr<const ExecuteDelivery::Goal> goal) {
+            if (busy_reject_ && job_active_) {
+                RCLCPP_WARN(get_logger(), "Rejecting delivery goal: robot is busy with job %u", active_job_id_.load());
+                return rclcpp_action::GoalResponse::REJECT;
+            }
+            if (jobs_.find(goal->job_id) == jobs_.end()) {
+                RCLCPP_WARN(get_logger(), "Rejecting delivery goal: unknown job id %u", goal->job_id);
+                return rclcpp_action::GoalResponse::REJECT;
+            }
+            RCLCPP_INFO(get_logger(), "Accepted delivery goal for job %u:", goal->job_id);
+            return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+        }
+
+        rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<GoalHandleDel> goal_handle) {
+            RCLCPP_INFO(get_logger(), "Received request to cancel delivery goal for job %u", goal_handle->get_goal()->job_id);
+            cancelling_ = true; 
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (active_nav_goal_) {
+                nav_client_->async_cancel_goal(active_nav_goal_);
+            }
+            return rclcpp_action::CancelResponse::ACCEPT;
+        }
+
+        void handle_accepted(const std::shared_ptr<GoalHandleDel> goal_handle) {
+            job_active_ = true;
+            cancelling_ = false;
+            std::thread{std::bind(&CourierServer::execute_delivery, this, std::placeholders::_1), goal_handle}.detach();
+        }
+
+        void execute_delivery(const std::shared_ptr<GoalHandleDel> goal_handle) {
+            const uint32_t job_id = goal_handle->get_goal()->job_id;
+            const Job& job = jobs_[job_id];
+            active_job_id_ = job_id;
+
+            const std::string legs[2] = {job.pickup, job.dropoff};  
+            const std::string leg_label[2] = {"pickup", "dropoff"};
+
+            rclcpp_action::ResultCode outcome;
+            std::string failed_leg;
+            uint32_t attempts = 0;
+
+            for (int i = 0; i < 2; ++i) {
+                if (cancelling_) break;
+
+                RCLCPP_INFO(get_logger(), "[job %u] %s leg -> %s", job_id, leg_label[i].c_str(), legs[i].c_str());
+                outcome = drive_to(legs[i], goal_handle, leg_label[i]);
+                attempts++;
+
+                if (cancelling_) {
+                    outcome = rclcpp_action::ResultCode::CANCELED;
+                    break;
+                }
+
+                if (outcome != rclcpp_action::ResultCode::SUCCEEDED) {
+                    failed_leg = leg_label[i];
+                    break;
+                }
+            }
+
+            auto result = std::make_shared<ExecuteDelivery::Result>();
+            result->success = (outcome == rclcpp_action::ResultCode::SUCCEEDED && !cancelling_);
+
+            result->failed_leg = failed_leg;
+            result->attempts = attempts;
+
+            if (cancelling_) {
+                goal_handle->canceled(result);
+            } else if (result->success) {
+                goal_handle->succeed(result);
+            } else {
+                goal_handle->abort(result);
+            }
+
+            job_active_ = false;
+
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            feedback_goal_.reset();
+            fb_distance_ = -1.0f;
+        }
+
 
 };
 

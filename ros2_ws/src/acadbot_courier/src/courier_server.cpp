@@ -14,6 +14,8 @@
 #include <atomic>   
 #include <future>
 #include <thread>
+#include <chrono>
+#include <algorithm>
 
 using namespace std::chrono_literals;
 using AcceptJob = acadbot_courier_interfaces::srv::AcceptJob;
@@ -93,6 +95,7 @@ class CourierServer : public rclcpp::Node {
         std::shared_ptr<GoalHandleDel> feedback_goal_;
         std::string fb_leg_, fb_target_;
         float fb_distance_{-1.0f};
+        std::string fb_note_;
         std::mutex state_mutex_;
         std::atomic<bool> cancelling_{false};
 
@@ -142,7 +145,7 @@ class CourierServer : public rclcpp::Node {
             }
         }
         
-        rclcpp_action::ResultCode drive_to(const std::string& name, const std::shared_ptr<GoalHandleDel>& goal_handle, const std::string& leg) {
+        rclcpp_action::ResultCode drive_to(const std::string& name, const std::shared_ptr<GoalHandleDel>& goal_handle, const std::string& leg, uint32_t attempt) {
             auto it = locations_.find(name);
             if (it == locations_.end()) {
                 RCLCPP_ERROR(get_logger(), "Unknown location '%s'", name.c_str());
@@ -196,11 +199,21 @@ class CourierServer : public rclcpp::Node {
                 fb_target_ = name;
                 fb_distance_ = -1.0f;
                 feedback_goal_ = goal_handle;
+                fb_note_ = "attempt " + std::to_string(attempt) + " of " + std::to_string(retry_count_);
             }
 
             nav_client_->async_send_goal(goal, options);
 
-            future.wait();
+            const auto send_time = std::chrono::steady_clock::now();
+            while (future.wait_for(250ms) != std::future_status::ready) {
+                if (cancelling_) nav_client_->async_cancel_goal(active_nav_goal_);
+                if (leg_timeout_sec_ > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - send_time).count() > leg_timeout_sec_) {
+                    RCLCPP_WARN(get_logger(), "Leg %s timed out after %.2f seconds; cancelling goal", leg.c_str(), leg_timeout_sec_);
+                    nav_client_->async_cancel_goal(active_nav_goal_);
+                    return rclcpp_action::ResultCode::ABORTED;  
+                }
+            }
+
             auto code = future.get();
             return code;
         }
@@ -212,6 +225,7 @@ class CourierServer : public rclcpp::Node {
             cf->leg = fb_leg_;
             cf->target_location = fb_target_;
             cf->distance_remaining = fb_distance_;
+            cf->note = fb_note_;
             feedback_goal_->publish_feedback(cf);
         }
 
@@ -252,26 +266,33 @@ class CourierServer : public rclcpp::Node {
             const std::string legs[2] = {job.pickup, job.dropoff};  
             const std::string leg_label[2] = {"pickup", "dropoff"};
 
-            rclcpp_action::ResultCode outcome;
+            rclcpp_action::ResultCode outcome = rclcpp_action::ResultCode::UNKNOWN;
             std::string failed_leg;
             uint32_t attempts = 0;
-
+            
             for (int i = 0; i < 2; ++i) {
-                if (cancelling_) break;
+                uint32_t attempt = 0;
 
-                RCLCPP_INFO(get_logger(), "[job %u] %s leg -> %s", job_id, leg_label[i].c_str(), legs[i].c_str());
-                outcome = drive_to(legs[i], goal_handle, leg_label[i]);
-                attempts++;
+                while (attempt < static_cast<uint32_t>(retry_count_) && !cancelling_) {
+                    ++attempt;
+                    ++attempts;
+                    RCLCPP_INFO(get_logger(), "[job %u] %s leg -> %s (attempts %u of %d)", job_id, leg_label[i].c_str(), legs[i].c_str(), attempt, retry_count_);
+                    outcome = drive_to(legs[i], goal_handle, leg_label[i], attempt);
 
-                if (cancelling_) {
-                    outcome = rclcpp_action::ResultCode::CANCELED;
-                    break;
+                    if (outcome == rclcpp_action::ResultCode::SUCCEEDED) break;
+                    if (attempt < static_cast<uint32_t>(retry_count_)) {
+                        RCLCPP_WARN(get_logger(), "[job %u] %s leg -> %s failed (%s), retrying in %.1f seconds", job_id, leg_label[i].c_str(), legs[i].c_str(), result_code_name(outcome), retry_delay_sec_);
+                        const int slices = std::max(1, static_cast<int>(retry_delay_sec_ * 10));
+                        for (int s = 0; s < slices && !cancelling_; ++s) {
+                            std::this_thread::sleep_for(100ms);
+                        }
+                    }
                 }
-
-                if (outcome != rclcpp_action::ResultCode::SUCCEEDED) {
+                if (outcome != rclcpp_action::ResultCode::SUCCEEDED && !cancelling_) {
                     failed_leg = leg_label[i];
                     break;
                 }
+                if (cancelling_) break;
             }
 
             auto result = std::make_shared<ExecuteDelivery::Result>();

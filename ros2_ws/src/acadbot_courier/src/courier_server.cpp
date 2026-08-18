@@ -1,7 +1,15 @@
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "tf2/LinearMath/Quaternion.h"
+
 #include "acadbot_courier_interfaces/srv/accept_job.hpp"
 
+using namespace std::chrono_literals;
 using AcceptJob = acadbot_courier_interfaces::srv::AcceptJob;
+using NavigateToPose = nav2_msgs::action::NavigateToPose;
+using GoalHandleNav = rclcpp_action::ClientGoalHandle<NavigateToPose>;
 
 struct Location {
     double x, y, yaw;
@@ -29,6 +37,9 @@ class CourierServer : public rclcpp::Node {
 
             accept_service_ = create_service<AcceptJob>("courier/accept_job", std::bind(&CourierServer::handle_accept_job, this, std::placeholders::_1, std::placeholders::_2));
 
+            nav_client_ = rclcpp_action::create_client<NavigateToPose>(this, "navigate_to_pose");
+            startup_timer_ = create_wall_timer(1s, std::bind(&CourierServer::wait_for_nav2, this));
+
             RCLCPP_INFO(get_logger(), "Courier server initialized with %zu locations, %d retries", locations_.size(), retry_count_);
             for (const auto& [name, loc] : locations_) {
                 RCLCPP_INFO(get_logger(), "Location %s: x=%.2f, y=%.2f, yaw=%.2f", name.c_str(), loc.x, loc.y, loc.yaw);
@@ -49,6 +60,9 @@ class CourierServer : public rclcpp::Node {
         uint32_t next_job_id_{1};
         bool job_active_{false};
         uint32_t active_job_id_{0};
+
+        rclcpp_action::Client<NavigateToPose>::SharedPtr nav_client_;
+        rclcpp::TimerBase::SharedPtr startup_timer_;
 
         void handle_accept_job(const std::shared_ptr<AcceptJob::Request> request, std::shared_ptr<AcceptJob::Response> response) {
             auto pickup = locations_.find(request->pickup_name);
@@ -85,11 +99,80 @@ class CourierServer : public rclcpp::Node {
 
             RCLCPP_INFO(get_logger(), "Accepted job %u: %s -> %s", id, request->pickup_name.c_str(), request->dropoff_name.c_str());
         }
+
+        void wait_for_nav2() {
+            if (!nav_client_->action_server_is_ready()) {
+                RCLCPP_INFO(get_logger(), "Waiting for Nav2 'navigate_to_pose' server...");
+                return;
+            }
+            startup_timer_->cancel();
+            std::thread(&CourierServer::drive_to, this, "lab_bench").detach();
+        }
+
+        const char* result_code_name(rclcpp_action::ResultCode code) {
+            switch (code) {
+                case rclcpp_action::ResultCode::SUCCEEDED: return "SUCCEEDED";
+                case rclcpp_action::ResultCode::CANCELED: return "CANCELED";
+                case rclcpp_action::ResultCode::ABORTED: return "ABORTED";
+                case rclcpp_action::ResultCode::UNKNOWN: return "UNKNOWN";
+                default: return "???";
+            }
+        }
+
+        
+        void drive_to(const std::string& name) {
+            auto it = locations_.find(name);
+            if (it == locations_.end()) {
+                RCLCPP_ERROR(get_logger(), "Unknown location '%s'", name.c_str());
+                return;
+            }
+            const Location& loc = it->second;
+
+            NavigateToPose::Goal goal;
+            goal.pose.header.frame_id = frame_id_;
+            goal.pose.header.stamp = now();
+            goal.pose.pose.position.x = loc.x;
+            goal.pose.pose.position.y = loc.y;
+            tf2::Quaternion q;
+            q.setRPY(0, 0, loc.yaw);
+            goal.pose.pose.orientation.x = q.x();
+            goal.pose.pose.orientation.y = q.y();
+            goal.pose.pose.orientation.z = q.z();
+            goal.pose.pose.orientation.w = q.w();
+
+            RCLCPP_INFO(get_logger(), "Driving to %s (%.2f,  %.2f, %.2f)", name.c_str(), loc.x, loc.y, loc.yaw);
+
+            auto promise = std::make_shared<std::promise<rclcpp_action::ResultCode>>();
+            auto future = promise->get_future();
+
+            rclcpp_action::Client<NavigateToPose>::SendGoalOptions options;
+            options.goal_response_callback = [promise](GoalHandleNav::SharedPtr gh) {
+                if (!gh) {
+                    promise->set_value(rclcpp_action::ResultCode::ABORTED);
+                }
+            };
+            options.feedback_callback = [](GoalHandleNav::SharedPtr, const std::shared_ptr<const NavigateToPose::Feedback> fb) {
+                RCLCPP_INFO(rclcpp::get_logger("courier_server"), " distance remaining %.2f m", fb->distance_remaining);
+            };
+            options.result_callback = [promise](const GoalHandleNav::WrappedResult& result) {
+                promise->set_value(result.code);
+            };
+
+            nav_client_->async_send_goal(goal, options);
+
+            future.wait();
+            auto code = future.get();
+            RCLCPP_INFO(get_logger(), "drive_to(%s) finished with code %d (%s)", name.c_str(), static_cast<int>(code), result_code_name(code));
+        }
+
 };
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<CourierServer>());
+    rclcpp::executors::MultiThreadedExecutor executor;
+    auto node = std::make_shared<CourierServer>();
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }

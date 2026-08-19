@@ -14,10 +14,12 @@ find_package(nav2_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(acadbot_courier_interfaces REQUIRED)
+find_package(behaviortree_cpp REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 
 add_executable(courier_server src/courier_server.cpp)
 ament_target_dependencies(courier_server
- rclcpp rclcpp_action geometry_msgs nav2_msgs tf2 tf2_geometry_msgs acadbot_courier_interfaces)
+ rclcpp rclcpp_action geometry_msgs nav2_msgs tf2 tf2_geometry_msgs acadbot_courier_interfaces behaviortree_cpp ament_index_cpp)
 
 add_executable(courier_client src/courier_client.cpp)
 ament_target_dependencies(courier_client

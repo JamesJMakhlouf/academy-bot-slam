@@ -7,6 +7,10 @@
 #include "acadbot_courier_interfaces/srv/accept_job.hpp"
 #include "acadbot_courier_interfaces/action/execute_delivery.hpp"
 
+#include "ament_index_cpp/get_package_share_directory.hpp"
+#include "behaviortree_cpp/bt_factory.h"
+#include "courier_bt_nodes.hpp"
+
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -41,6 +45,7 @@ class CourierServer : public rclcpp::Node {
             feedback_period_sec_ = declare_parameter<double>("feedback_period_sec", 1.0);
             leg_timeout_sec_ = declare_parameter<double>("leg_timeout_sec", 0.0);
             busy_reject_ = declare_parameter<bool>("busy_reject", true);
+            mission_mode_ = declare_parameter<std::string>("mission_mode", "bt");
 
             auto names = declare_parameter<std::vector<std::string>>("location_names", std::vector<std::string>{});
             auto poses = declare_parameter<std::vector<double>>("location_poses", std::vector<double>{});
@@ -78,6 +83,7 @@ class CourierServer : public rclcpp::Node {
         double feedback_period_sec_;
         double leg_timeout_sec_;
         bool busy_reject_;
+        std::string mission_mode_;
         std::unordered_map<std::string, Location> locations_;
 
         rclcpp::Service<AcceptJob>::SharedPtr accept_service_;
@@ -259,6 +265,14 @@ class CourierServer : public rclcpp::Node {
         }
 
         void execute_delivery(const std::shared_ptr<GoalHandleDel> goal_handle) {
+            if (mission_mode_ == "bt") {
+                execute_delivery_bt(goal_handle);
+            } else {
+                execute_delivery_loop(goal_handle);
+            }
+        }
+
+        void execute_delivery_loop(const std::shared_ptr<GoalHandleDel> goal_handle) {
             const uint32_t job_id = goal_handle->get_goal()->job_id;
             const Job& job = jobs_[job_id];
             active_job_id_ = job_id;
@@ -309,6 +323,104 @@ class CourierServer : public rclcpp::Node {
                 goal_handle->abort(result);
             }
 
+            finish_delivery();
+        }
+
+        void execute_delivery_bt(const std::shared_ptr<GoalHandleDel> goal_handle) {
+            const uint32_t job_id = goal_handle->get_goal()->job_id;
+            const Job& job = jobs_[job_id];
+            active_job_id_ = job_id;
+
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                feedback_goal_ = goal_handle;
+                fb_distance_ = -1.0f;
+            }
+
+            RCLCPP_INFO(get_logger(), "[job %u] starting behavior-tree mission (mission_mode 'bt')", job_id);
+
+            auto context = std::make_shared<acadbot_courier::CourierNavContext>();
+            context->node = shared_from_this();
+            context->frame_id = frame_id_;
+            for (const auto& [name, loc] : locations_) {
+                context->locations[name] = {loc.x, loc.y, loc.yaw};
+            }
+            context->is_cancelled = [this]() { return cancelling_.load(); };
+            context->on_feedback = [this](const std::string& leg, const std::string& target,
+                                          float distance, const std::string& note) {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                fb_leg_ = leg;
+                fb_target_ = target;
+                fb_distance_ = distance;
+                fb_note_ = note;
+            };
+
+            BT::BehaviorTreeFactory factory;
+            acadbot_courier::registerCourierNodes(factory, context);
+
+            auto blackboard = BT::Blackboard::create();
+            auto pose_str = [&](const std::string & name) -> std::string {
+                auto it = locations_.find(name);
+                if (it == locations_.end()) { return "0,0,0"; }
+                const auto & loc = it->second;
+                return std::to_string(loc.x) + "," + std::to_string(loc.y) + "," +
+                       std::to_string(loc.yaw);
+            };
+            blackboard->set<std::string>("pickup_name", job.pickup);
+            blackboard->set<std::string>("dropoff_name", job.dropoff);
+            blackboard->set<std::string>("pickup_pose", pose_str(job.pickup));
+            blackboard->set<std::string>("dropoff_pose", pose_str(job.dropoff));
+            blackboard->set<int>("retry_count", retry_count_);
+            const int timeout_msec = leg_timeout_sec_ > 0.0
+                                         ? static_cast<int>(leg_timeout_sec_ * 1000.0)
+                                         : 120000;
+            blackboard->set<unsigned int>("leg_timeout_msec",
+                                          static_cast<unsigned int>(timeout_msec));
+            blackboard->set<unsigned int>("retry_delay_msec",
+                                          static_cast<unsigned int>(retry_delay_sec_ * 1000.0));
+            blackboard->set<int>("attempts", 0);
+            blackboard->set<std::string>("failed_leg", "");
+
+            const std::string bt_path =
+                ament_index_cpp::get_package_share_directory("acadbot_courier") +
+                "/config/courier_bt.xml";
+            auto tree = factory.createTreeFromFile(bt_path, blackboard);
+
+            BT::NodeStatus status = BT::NodeStatus::RUNNING;
+            while (rclcpp::ok() && !cancelling_.load() && status == BT::NodeStatus::RUNNING) {
+                status = tree.tickOnce();
+                if (status == BT::NodeStatus::RUNNING) {
+                    std::this_thread::sleep_for(100ms);
+                }
+            }
+            if (cancelling_.load()) {
+                tree.haltTree();
+            }
+
+            auto result = std::make_shared<ExecuteDelivery::Result>();
+            if (status == BT::NodeStatus::SUCCESS && !cancelling_.load()) {
+                result->success = true;
+                result->failed_leg = "";
+            } else {
+                result->success = false;
+                static_cast<void>(blackboard->get("failed_leg", result->failed_leg));
+            }
+            int attempts = 0;
+            static_cast<void>(blackboard->get("attempts", attempts));
+            result->attempts = static_cast<uint32_t>(attempts);
+
+            if (cancelling_.load()) {
+                goal_handle->canceled(result);
+            } else if (result->success) {
+                goal_handle->succeed(result);
+            } else {
+                goal_handle->abort(result);
+            }
+
+            finish_delivery();
+        }
+
+        void finish_delivery() {
             job_active_ = false;
 
             std::lock_guard<std::mutex> lock(state_mutex_);

@@ -4,6 +4,7 @@
 #include "acadbot_courier_interfaces/action/execute_delivery.hpp"
 
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -22,6 +23,15 @@ namespace {
         std::string failed_leg;
         uint32_t attempts = 0;
     };
+
+    // Ctrl-C handling: rclcpp's default SIGINT handler calls shutdown() which
+    // makes the wait loops below hang. Override it so we can cancel the action
+    // cleanly and exit.
+    volatile std::sig_atomic_t g_interrupt_requested = 0;
+
+    void handle_sigint(int) {
+        g_interrupt_requested = 1;
+    }
 
 }
 
@@ -72,6 +82,10 @@ class CourierClient : public rclcpp::Node {
             while (future.wait_for(250ms) != std::future_status::ready) {
                 if (std::chrono::steady_clock::now() > timeout) {
                     RCLCPP_ERROR(this->get_logger(), "timed out waiting for accept_job response");
+                    return false;
+                }
+                if (g_interrupt_requested) {
+                    RCLCPP_WARN(this->get_logger(), "interrupted while waiting for accept_job");
                     return false;
                 }
                 executor.spin_some();
@@ -131,11 +145,34 @@ class CourierClient : public rclcpp::Node {
                 };
             delivery_client_->async_send_goal(goal, options);
 
+            const auto interrupt_start = std::chrono::steady_clock::now();
+            bool cancel_sent = false;
             while (result_future.wait_for(250ms) != std::future_status::ready) {
                 executor.spin_some();
+                if (g_interrupt_requested) {
+                    if (!cancel_sent) {
+                        cancel_sent = true;
+                        RCLCPP_WARN(this->get_logger(), "Ctrl-C received - cancelling delivery");
+                        if (goal_handle_) {
+                            delivery_client_->async_cancel_goal(goal_handle_);
+                        }
+                    }
+                    if (std::chrono::steady_clock::now() - interrupt_start > 2s) {
+                        RCLCPP_WARN(this->get_logger(), "cancel not confirmed within 2 s, exiting");
+                        break;
+                    }
+                }
             }
 
-            auto result = result_future.get();
+            DeliveryResult result;
+            if (result_future.wait_for(0s) != std::future_status::ready) {
+                result.status = rclcpp_action::ResultCode::CANCELED;
+                result.success = false;
+                result.failed_leg = "interrupted";
+            } else {
+                result = result_future.get();
+            }
+
             RCLCPP_INFO(this->get_logger(),
                         "Result: success=%s, failed_leg='%s', attempts=%u, status=%d",
                         result.success ? "true" : "false", result.failed_leg.c_str(),
@@ -162,8 +199,12 @@ class CourierClient : public rclcpp::Node {
 };
 
 int main(int argc, char ** argv) {                                                    
-    rclcpp::init(argc, argv);                                                           
-    auto node = std::make_shared<CourierClient>();                                      
+rclcpp::init(argc, argv);
+    // Replace rclcpp's SIGINT handler so Ctrl-C lets us cancel the delivery
+    // cleanly instead of hanging the wait loop.
+    std::signal(SIGINT, handle_sigint);
+    std::signal(SIGTERM, handle_sigint);
+    auto node = std::make_shared<CourierClient>();
     rclcpp::executors::SingleThreadedExecutor executor;                                 
     executor.add_node(node);                                                            
                                                                                         
